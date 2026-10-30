@@ -88,6 +88,8 @@ _COORDINATOR_LOOP_ERROR_MAX_DELAY = 30.0
 _PROGRESS_BROADCAST_START_PERCENT = 1
 _PROGRESS_BROADCAST_COMPLETE_PERCENT = 99
 _PROGRESS_BROADCAST_MIN_DELTA = 10
+MAX_STALL_RETRIES = 2
+_stall_retry_counts: dict[str, int] = {}
 
 
 def _resolve_email_destination(
@@ -1204,9 +1206,40 @@ def _source_has_room(task: DownloadTask, *, running: dict[str | None, int], limi
 def _working_source_of(task_id: str) -> str | None:
     """The source a running task counts against, or None when it is only waiting in a client queue."""
     task = book_queue.get_task(task_id)
-    if task is None or task.client_queued:
+    status = book_queue.get_task_status(task_id)
+    if task is None or task.client_queued or status in (
+        QueueStatus.CANCELLED,
+        QueueStatus.COMPLETE,
+        QueueStatus.ERROR,
+    ):
         return None
     return task.source
+
+
+def _retry_stalled_download(task_id: str) -> bool:
+    """Requeue a stalled task after its worker has stopped.
+
+    The task keeps its original source metadata, but receives a new queue item only after
+    its cancelled worker has returned, preventing two attempts from sharing the same task ID.
+    """
+    attempt = _stall_retry_counts.get(task_id, 0) + 1
+    if attempt > MAX_STALL_RETRIES:
+        logger.warning("Task %s exhausted %s automatic stall retries", task_id, MAX_STALL_RETRIES)
+        return False
+
+    _stall_retry_counts[task_id] = attempt
+    if not book_queue.enqueue_existing(task_id, priority=-10):
+        logger.warning("Task %s could not be requeued after stalling", task_id)
+        return False
+
+    book_queue.update_status_message(
+        task_id,
+        f"Retrying after stalled download ({attempt}/{MAX_STALL_RETRIES})",
+    )
+    logger.info("Task %s queued for automatic retry (%s/%s)", task_id, attempt, MAX_STALL_RETRIES)
+    if ws_manager:
+        ws_manager.broadcast_status_update(queue_status())
+    return True
 
 
 def _source_of(task_id: str) -> str | None:
@@ -1236,12 +1269,15 @@ def concurrent_download_loop() -> None:
                 completed_futures = [f for f in active_futures if f.done()]
                 for future in completed_futures:
                     task_id, cancel_flag = active_futures.pop(future)
+                    was_stalled = task_id in stalled_tasks
                     stalled_tasks.discard(task_id)
                     if future.cancelled():
                         _cleanup_progress_tracking(task_id)
                         if cancel_flag.is_set():
                             logger.info("Download cancelled: %s", task_id)
                             book_queue.update_status(task_id, QueueStatus.CANCELLED)
+                            if was_stalled:
+                                _retry_stalled_download(task_id)
                         else:
                             logger.warning("Future cancelled unexpectedly for %s", task_id)
                             task = book_queue.get_task(task_id)
@@ -1258,13 +1294,20 @@ def concurrent_download_loop() -> None:
 
                     worker_error = future.exception()
                     if worker_error is None:
+                        if was_stalled:
+                            _retry_stalled_download(task_id)
+                        else:
+                            _stall_retry_counts.pop(task_id, None)
                         continue
 
                     _cleanup_progress_tracking(task_id)
                     if cancel_flag.is_set():
                         logger.info("Download cancelled: %s", task_id)
                         book_queue.update_status(task_id, QueueStatus.CANCELLED)
+                        if was_stalled:
+                            _retry_stalled_download(task_id)
                     else:
+                        _stall_retry_counts.pop(task_id, None)
                         logger.error_trace("Future exception for %s: %s", task_id, worker_error)
                         task = book_queue.get_task(task_id)
                         if task:

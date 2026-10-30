@@ -53,6 +53,52 @@ def test_retry_download_requeues_error_task(monkeypatch):
     mock_queue.update_status_message.assert_called_once_with("task-1", "Retrying now")
 
 
+def test_stalled_download_is_requeued_after_worker_exits(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    mock_queue = MagicMock()
+    mock_queue.enqueue_existing.return_value = True
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+    orchestrator._stall_retry_counts.clear()
+
+    assert orchestrator._retry_stalled_download("task-1") is True
+
+    mock_queue.enqueue_existing.assert_called_once_with("task-1", priority=-10)
+    mock_queue.update_status_message.assert_called_once_with(
+        "task-1",
+        f"Retrying after stalled download (1/{orchestrator.MAX_STALL_RETRIES})",
+    )
+
+
+def test_stalled_download_stops_retrying_after_limit(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    mock_queue = MagicMock()
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+    monkeypatch.setattr(
+        orchestrator,
+        "_stall_retry_counts",
+        {"task-1": orchestrator.MAX_STALL_RETRIES},
+    )
+
+    assert orchestrator._retry_stalled_download("task-1") is False
+    mock_queue.enqueue_existing.assert_not_called()
+
+
+def test_cancelled_task_does_not_consume_per_source_capacity(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    task = DownloadTask(task_id="task-1", source="direct_download", title="Cancelled")
+    mock_queue = MagicMock()
+    mock_queue.get_task.return_value = task
+    mock_queue.get_task_status.return_value = QueueStatus.CANCELLED
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+
+    assert orchestrator._working_source_of("task-1") is None
+
+
 def test_retry_download_rejects_request_linked_tasks(monkeypatch):
     import shelfmark.download.orchestrator as orchestrator
 

@@ -882,7 +882,13 @@ def _enrich_search_results_with_downloads(books: list[BrowseRecord]) -> None:
             book.info["Downloads"] = [str(counts[book.id])]
 
 
-def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseRecord:
+def get_book_info(
+    book_id: str,
+    *,
+    fetch_download_count: bool = True,
+    cancel_flag: Event | None = None,
+    status_callback: Callable[[str, str | None], None] | None = None,
+) -> BrowseRecord:
     """Get detailed information for a specific book.
 
     Args:
@@ -897,7 +903,13 @@ def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseR
     url = f"{network.get_aa_base_url()}/md5/{book_id}"
     selector = network.AAMirrorSelector()
     # Same challenge as search: the detail page is gated on every mirror, so bypass it.
-    html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=True)
+    html = downloader.html_get_page(
+        url,
+        selector=selector,
+        cancel_flag=cancel_flag,
+        status_callback=status_callback,
+        allow_bypasser_fallback=True,
+    )
 
     if not html:
         detail = getattr(selector, "last_failure", None) or (
@@ -1291,7 +1303,12 @@ def _group_urls_by_source(urls: list[str], urls_by_source: dict[str, list[str]])
             urls_by_source.setdefault(source_type, []).append(url)
 
 
-def _fetch_aa_page_urls(book_info: BrowseRecord, urls_by_source: dict[str, list[str]]) -> None:
+def _fetch_aa_page_urls(
+    book_info: BrowseRecord,
+    urls_by_source: dict[str, list[str]],
+    cancel_flag: Event | None,
+    status_callback: Callable[[str, str | None], None] | None,
+) -> None:
     """Fetch and parse AA page, populating urls_by_source dict.
 
     Groups existing book_info.download_urls by source type. If book_info
@@ -1302,7 +1319,12 @@ def _fetch_aa_page_urls(book_info: BrowseRecord, urls_by_source: dict[str, list[
         return
 
     try:
-        fresh_book_info = get_book_info(book_info.id, fetch_download_count=False)
+        fresh_book_info = get_book_info(
+            book_info.id,
+            fetch_download_count=False,
+            cancel_flag=cancel_flag,
+            status_callback=status_callback,
+        )
         _group_urls_by_source(fresh_book_info.download_urls, urls_by_source)
     except (SearchUnavailableError, RuntimeError, TypeError, AttributeError) as e:
         logger.warning("Failed to fetch AA page: %s", e)
@@ -1345,7 +1367,7 @@ def _get_urls_for_source(
         if not urls_by_source:
             if status_callback:
                 status_callback("resolving", "Fetching download sources")
-            _fetch_aa_page_urls(book_info, urls_by_source)
+            _fetch_aa_page_urls(book_info, urls_by_source, cancel_flag, status_callback)
 
         return urls_by_source.get(source_id, [])
 
