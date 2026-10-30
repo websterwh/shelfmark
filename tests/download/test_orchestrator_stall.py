@@ -30,6 +30,7 @@ def _reset(orchestrator) -> None:
     orchestrator._last_status_event.clear()
     orchestrator._activity_grace.clear()
     orchestrator._activity_grace_seconds.clear()
+    orchestrator._worker_greenlets.clear()
 
 
 def test_find_stalled_tasks_flags_task_past_stall_timeout():
@@ -290,6 +291,21 @@ def test_cancel_stalled_task_does_not_hold_the_progress_lock(monkeypatch):
     mock_queue.update_status_message.assert_called_once_with(
         "book", f"Download stalled (no activity for {orchestrator.STALL_TIMEOUT}s)"
     )
+
+
+def test_cancel_stalled_task_terminates_the_registered_gevent_worker(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    _reset(orchestrator)
+    mock_queue = MagicMock()
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    worker = MagicMock()
+    orchestrator._worker_greenlets["book"] = worker
+
+    orchestrator._cancel_stalled_task("book")
+
+    mock_queue.cancel_download.assert_called_once_with("book")
+    worker.kill.assert_called_once_with(block=False)
 
 
 def test_the_stall_reason_is_set_before_the_cancel_finalises_history(monkeypatch):

@@ -14,6 +14,9 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import TYPE_CHECKING, Any
 
+from gevent import getcurrent as getcurrent_greenlet
+from gevent import monkey as gevent_monkey
+
 from shelfmark.core.config import config
 from shelfmark.core.logger import setup_logger
 from shelfmark.core.models import DownloadTask, QueueStatus, SearchMode, normalize_format
@@ -64,6 +67,9 @@ except ImportError:
 # Progress update throttling - track last broadcast time per book
 _progress_last_broadcast: dict[str, float] = {}
 _progress_lock = Lock()
+# A gevent worker can be interrupted at a cooperative I/O boundary. This is separate from
+# the queue's cancellation flag: a flag is only observed once a blocked operation returns.
+_worker_greenlets: dict[str, Any] = {}
 
 # Stall detection - track last activity time per download
 _last_activity: dict[str, float] = {}
@@ -1098,29 +1104,39 @@ def _finalize_download_failure(task_id: str) -> None:
 
 def _process_single_download(task_id: str, cancel_flag: Event) -> None:
     """Process a single download job."""
-    # Status will be updated through callbacks during download process
-    # (resolving -> downloading -> complete)
-    download_path = _download_task(task_id, cancel_flag)
+    worker = None
+    if gevent_monkey.is_module_patched("threading"):
+        worker = getcurrent_greenlet()
+        with _progress_lock:
+            _worker_greenlets[task_id] = worker
 
-    # Clean up progress tracking
-    _cleanup_progress_tracking(task_id)
+    try:
+        # Status will be updated through callbacks during download process
+        # (resolving -> downloading -> complete)
+        download_path = _download_task(task_id, cancel_flag)
 
-    if cancel_flag.is_set():
-        book_queue.update_status(task_id, QueueStatus.CANCELLED)
-        # Broadcast cancellation
+        if cancel_flag.is_set():
+            book_queue.update_status(task_id, QueueStatus.CANCELLED)
+            # Broadcast cancellation
+            if ws_manager:
+                ws_manager.broadcast_status_update(queue_status())
+            return
+
+        if download_path:
+            book_queue.update_download_path(task_id, download_path)
+            book_queue.update_status(task_id, QueueStatus.COMPLETE)
+        else:
+            _finalize_download_failure(task_id)
+
+        # Broadcast final status (completed or error)
         if ws_manager:
             ws_manager.broadcast_status_update(queue_status())
-        return
-
-    if download_path:
-        book_queue.update_download_path(task_id, download_path)
-        book_queue.update_status(task_id, QueueStatus.COMPLETE)
-    else:
-        _finalize_download_failure(task_id)
-
-    # Broadcast final status (completed or error)
-    if ws_manager:
-        ws_manager.broadcast_status_update(queue_status())
+    finally:
+        _cleanup_progress_tracking(task_id)
+        if worker is not None:
+            with _progress_lock:
+                if _worker_greenlets.get(task_id) is worker:
+                    _worker_greenlets.pop(task_id, None)
 
 
 def set_activity_grace(book_id: str, seconds: float) -> None:
@@ -1187,6 +1203,13 @@ def _cancel_stalled_task(task_id: str) -> None:
         f"Download stalled (no activity for {int(window)}s)",
     )
     book_queue.cancel_download(task_id)
+    with _progress_lock:
+        worker = _worker_greenlets.get(task_id)
+    if worker is not None:
+        # A greenlet kill injects GreenletExit at its next cooperative boundary. Never
+        # wait here: a task that ignores cancellation must not block the coordinator.
+        logger.info("Terminating stalled gevent worker for %s", task_id)
+        worker.kill(block=False)
 
 
 # With a per-source limit the pool must hold every source's downloads at once.
